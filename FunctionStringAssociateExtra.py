@@ -1,6 +1,7 @@
 import idaapi
 import ida_auto
 import ida_kernwin
+import idc
 
 import re
 import string
@@ -59,12 +60,48 @@ def is_pretty_printable(s: str) -> bool:
 
 
 def _read_string_at(db: Database, ea: int) -> str | None:
-    """Try to read a null-terminated string at ea using ida-domain Bytes handler."""
+    """Try to read a null-terminated string at ea using ida-domain Bytes handler or idc."""
     try:
         if not db.is_valid_ea(ea):
             return None
     except Exception:
         return None
+
+    try:
+        str_type = idc.get_str_type(ea)
+        if str_type is not None and str_type != -1:
+            raw_bytes = idc.get_strlit_contents(ea, -1, str_type)
+            if raw_bytes:
+                if isinstance(raw_bytes, bytes):
+                    if str_type == getattr(idc, 'STRTYPE_C_16', 1):
+                        return raw_bytes.decode('utf-16le', errors='ignore')
+                    return raw_bytes.decode('utf-8', errors='ignore')
+                return str(raw_bytes)
+    except Exception:
+        pass
+
+    try:
+        c_bytes = idc.get_strlit_contents(ea, -1, getattr(idc, 'STRTYPE_C', 0))
+        if isinstance(c_bytes, bytes):
+            c_str = c_bytes.decode('utf-8', errors='ignore')
+        else:
+            c_str = str(c_bytes) if c_bytes else ""
+    except Exception:
+        c_str = ""
+
+    try:
+        c16_bytes = idc.get_strlit_contents(ea, -1, getattr(idc, 'STRTYPE_C_16', 1))
+        if isinstance(c16_bytes, bytes):
+            c16_str = c16_bytes.decode('utf-16le', errors='ignore')
+        else:
+            c16_str = str(c16_bytes) if c16_bytes else ""
+    except Exception:
+        c16_str = ""
+        
+    best_str = c16_str if len(c16_str) > len(c_str) else c_str
+    if best_str:
+        return best_str
+
     try:
         return db.bytes.get_string_at(ea)
     except Exception:
