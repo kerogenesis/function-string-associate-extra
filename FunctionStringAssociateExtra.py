@@ -1,417 +1,819 @@
-import idaapi
-import ida_auto
-import ida_kernwin
-import idc
+# -*- coding: utf-8 -*-
 
 import re
-import string
+import string as _string
 import time
 import unicodedata
 
-from PySide6 import QtWidgets
+import idaapi
+import idautils
+import idc
+import ida_bytes
+import ida_funcs
+import ida_name
+import ida_kernwin
+import ida_auto
 
-from ida_domain import Database
-from ida_domain.operands import ImmediateOperand
 
-
-MAX_LINE_STRING_COUNT = 10
-MAX_LABEL_STRING = 60
-MAX_COMMENT_SIZE = 764
-MIN_STRING_SIZE = 4
-
+# Configuration
 PLUGIN_NAME = "Function String Associate Extra"
 PLUGIN_HOTKEY = ""
 
-g_replace_comments = False
+MIN_STRING_SIZE = 4
+MAX_STRING_SIZE = 512
+MAX_COMMENT_SIZE = 764
+MAX_LINE_STRING_COUNT = 10   # max strings placed into a single function comment
+MAX_STRINGS_SCANNED = 64     # cap on distinct strings inspected per function
+MIN_FUNC_SIZE = 8            # same as the original plugin: skip tiny thunks
+MAX_FUNC_COMMENT = 2000
+
+# Codecs tried for single-byte strings, in priority order.
+ANSI_CODECS = ("utf-8", "cp1251", "cp1252", "cp949")
+
+# Helpers whose call sites carry the function name. Matched as a substring
+# against the demangled symbol name of the call target.
+UNWIND_HELPERS = ("AppUnwindF", "AppUnwind", "AppMsg", "UnwindF")
+
+# Collision handling: "index" -> Name, Name_1, Name_2 ...
+#                    "addr"  -> Name, Name_401000, Name_402000 ...
+SUFFIX_MODE = "index"
+
+# MSVC FuncInfo signatures.
+FUNCINFO_MAGIC = (0x19930520, 0x19930521, 0x19930522)
+
+MAX_TRY_BLOCKS = 512
+MAX_CATCHES = 256
+MAX_HANDLER_INSNS = 256
+
+# Confidence scores for competing name sources.
+CONF_SEH = 100      # name taken from a catch handler (structural walk)
+CONF_CALLSITE = 60  # string pushed right before a call to an unwind helper
+CONF_STRING = 20    # plain name-shaped string somewhere inside the function
+
+# Compatibility layer (avoids deprecated APIs)
+_GET_CMT_EA = getattr(ida_funcs, "get_func_cmt_ea", None)
+_SET_CMT_EA = getattr(ida_funcs, "set_func_cmt_ea", None)
+_GET_FUNC_START = getattr(ida_funcs, "get_func_start", None)
 
 
-def filter_whitespace(input_string: str) -> str:
+def func_start(ea):
+    """Start of the function containing ea, or BADADDR."""
+    if _GET_FUNC_START is not None:
+        try:
+            return _GET_FUNC_START(ea)
+        except Exception:
+            pass
+    return idc.get_func_attr(ea, idc.FUNCATTR_START)
+
+
+def func_size(func_ea):
+    start = idc.get_func_attr(func_ea, idc.FUNCATTR_START)
+    end = idc.get_func_attr(func_ea, idc.FUNCATTR_END)
+    if start == idc.BADADDR or end == idc.BADADDR or end <= start:
+        return 0
+    return end - start
+
+
+def is_inside_function(ea):
+    return func_start(ea) != idc.BADADDR
+
+
+def get_func_comment(func_ea, repeatable=True):
+    try:
+        if _GET_CMT_EA is not None:
+            return _GET_CMT_EA(func_ea, repeatable) or ""
+        return idc.get_func_cmt(func_ea, repeatable) or ""
+    except Exception:
+        return ""
+
+
+def set_func_comment(func_ea, text, repeatable=True):
+    try:
+        if _SET_CMT_EA is not None:
+            return bool(_SET_CMT_EA(func_ea, text, repeatable))
+        return bool(idc.set_func_cmt(func_ea, text, repeatable))
+    except Exception:
+        return False
+
+
+def get_function_name(func_ea):
+    """Raw (still mangled) name as stored in the database."""
+    return idc.get_func_name(func_ea) or ""
+
+
+
+# String reading
+
+_STR_CACHE = {}
+
+
+def _is_loaded(ea):
+    return ea not in (None, 0, idc.BADADDR) and ida_bytes.is_loaded(ea)
+
+
+def is_string_target(ea):
+    """Reject addresses that cannot hold a string literal.
+
+    This is the main defense against garbage: immediates that are really code
+    addresses, sizes or flags never reach the decoder.
     """
-    Replaces all non-printable ASCII characters with a space and trims result.
+    if not _is_loaded(ea):
+        return False
+    if ida_bytes.is_code(ida_bytes.get_flags(ea)):
+        return False
+    if is_inside_function(ea):
+        return False
+    return True
+
+
+def _decode_literal(raw):
+    """Decode literal bytes returned by IDA.
+
+    For 16-bit literals IDA may hand back raw UTF-16LE bytes; without this
+    check "MOVE" would end up as "M O V E" after whitespace filtering.
     """
-    return "".join(ch if " " <= ch <= "~" else " " for ch in input_string).strip()
+    if not isinstance(raw, bytes):
+        return str(raw)
+    if b"\x00" in raw:
+        try:
+            txt = raw.decode("utf-16le", errors="ignore").rstrip("\x00")
+            if txt:
+                return txt
+        except Exception:
+            pass
+    return raw.decode("utf-8", errors="ignore")
 
 
-def safe_func_name(name):
+def read_utf16_string(ea, max_chars=MAX_STRING_SIZE):
+    if not _is_loaded(ea):
+        return None
+    out = bytearray()
+    cur = ea
+    for _ in range(max_chars):
+        chunk = ida_bytes.get_bytes(cur, 2)
+        if not chunk or len(chunk) != 2:
+            return None
+        if chunk == b"\x00\x00":
+            try:
+                return out.decode("utf-16le")
+            except UnicodeDecodeError:
+                return None
+        out += chunk
+        cur += 2
+    return None
+
+
+def read_ansi_string(ea, max_chars=MAX_STRING_SIZE):
+    """Read a NUL-terminated single-byte string, trying each codec in turn."""
+    if not _is_loaded(ea):
+        return None
+    out = bytearray()
+    cur = ea
+    terminated = False
+    for _ in range(max_chars):
+        b = ida_bytes.get_bytes(cur, 1)
+        if not b:
+            break
+        if b == b"\x00":
+            terminated = True
+            break
+        out += b
+        cur += 1
+    # An unterminated run is almost always binary noise, not a string.
+    if not terminated or not out:
+        return None
+    for codec in ANSI_CODECS:
+        try:
+            return out.decode(codec)
+        except UnicodeDecodeError:
+            continue
+    return None
+
+
+def read_any_string(ea):
+    """Return (text, from_literal).
+
+    from_literal is True when IDA itself has the address marked as a string
+    literal. Such strings are trusted like in the original plugin; raw reads are
+    validated by is_comment_worthy() instead.
+    """
+    cached = _STR_CACHE.get(ea)
+    if cached is not None:
+        return cached
+
+    result = (None, False)
+    if _is_loaded(ea):
+        flags = ida_bytes.get_flags(ea)
+        # Only ask IDA about literals it already defined, otherwise the kernel
+        # may attempt an item conversion and fail with "MakeData".
+        if ida_bytes.is_strlit(flags):
+            try:
+                st = idc.get_str_type(ea)
+                if st is not None and st != -1:
+                    raw = ida_bytes.get_strlit_contents(ea, -1, st)
+                    if raw:
+                        txt = _decode_literal(raw)
+                        if txt and len(txt) >= MIN_STRING_SIZE:
+                            result = (txt, True)
+            except Exception:
+                pass
+
+        if result[0] is None:
+            w = read_utf16_string(ea)
+            a = read_ansi_string(ea)
+
+            def score(s):
+                if not s or len(s) < MIN_STRING_SIZE:
+                    return -1
+                printable = sum(1 for ch in s if ch.isprintable())
+                return printable * 2 - (len(s) - printable) * 4
+
+            sw, sa = score(w), score(a)
+            if sw > 0 or sa > 0:
+                result = ((w, False) if sw >= sa else (a, False))
+
+    if len(_STR_CACHE) < 200000:
+        _STR_CACHE[ea] = result
+    return result
+
+
+# Quality filters and name normalization
+def filter_whitespace(s):
+    return "".join(ch if " " <= ch <= "~" else " " for ch in s).strip()
+
+
+def is_pretty_printable(s):
+    letters = sum(1 for ch in s if ch in _string.ascii_letters + _string.digits)
+    printable = sum(1 for ch in s if ch in _string.printable and ch not in "\t\r\n\x0b\x0c")
+    if not s or printable == 0:
+        return False
+    return letters >= 3 and (printable / len(s)) > 0.7
+
+
+_REPEAT_RE = re.compile(r"(.)\1{6,}")
+_HEX_JUNK_RE = re.compile(r"[0-9A-Fa-f ]{8,}")
+_ALLOWED_PUNCT = set(" _.:/\\-%()[]{}'\"!?,;=+*<>#@&|$^~`")
+
+
+def is_comment_worthy(text, from_literal):
+    """Decide whether a string may enter a function comment.
+
+    IDA literals follow the original plugin's rules. Raw reads are checked much
+    harder, since arbitrary bytes can decode into plausible-looking text.
+    """
+    if not text or len(text) < MIN_STRING_SIZE or len(text) > MAX_STRING_SIZE:
+        return False
+    if not is_pretty_printable(text):
+        return False
+    if from_literal:
+        return True
+
+    good = sum(1 for ch in text if ch.isalnum() or ch in _ALLOWED_PUNCT)
+    if good / len(text) < 0.95:
+        return False
+    letters = sum(1 for ch in text if ch.isalpha())
+    if letters < max(3, len(text) // 4):
+        return False
+    if _REPEAT_RE.search(text):          # runs like "aaaaaaaa"
+        return False
+    if _HEX_JUNK_RE.fullmatch(text):     # pure hex dumps
+        return False
+    return True
+
+
+# Matches Foo, Foo::Bar, Foo::Bar::Baz, Foo::~Bar
+_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(::~?[A-Za-z_][A-Za-z0-9_]*)*$")
+
+
+def looks_like_func_name(s):
+    if not s or len(s) > 200:
+        return False
+    s = s.strip()
+    if " " in s or "%" in s:
+        return False
+    return bool(_NAME_RE.match(s))
+
+
+def sanitize_name(name):
+    """Turn a raw name into something IDA accepts, keeping :: and mapping ~."""
+    name = name.strip().replace("~", "dtor_")
     clean = []
     for ch in name:
-        if (
-            ch.isalnum()
-            or ch in ['_', ':', '~']
-            or unicodedata.category(ch)[0] in {'L', 'N'}
-        ):
+        if ch.isalnum() or ch in ("_", ":") or unicodedata.category(ch)[0] in ("L", "N"):
             clean.append(ch)
         else:
-            clean.append('_')
-    return ''.join(clean)[:250]
-
-
-def safe_comment_text(s):
-    return s.replace('\x00', ' ').replace('\r', ' ')[:750]
-
-
-def is_pretty_printable(s: str) -> bool:
-    letters = sum(1 for ch in s if ch in string.ascii_letters + string.digits)
-    printable = sum(1 for ch in s if ch in string.printable and ch not in '\t\r\n\x0b\x0c')
-    l = len(s)
-    if l == 0 or printable == 0:
-        return False
-    return letters >= 3 and (printable / l) > 0.7
-
-
-def _read_string_at(db: Database, ea: int) -> str | None:
-    """Try to read a null-terminated string at ea using ida-domain Bytes handler or idc."""
+            clean.append("_")
+    out = "".join(clean)[:200]
+    out = re.sub(r"_{3,}", "__", out)
     try:
-        if not db.is_valid_ea(ea):
-            return None
+        validated = ida_name.validate_name(out, ida_name.VNT_IDENT, ida_name.SN_NOCHECK)
     except Exception:
-        return None
-
-    try:
-        str_type = idc.get_str_type(ea)
-        if str_type is not None and str_type != -1:
-            raw_bytes = idc.get_strlit_contents(ea, -1, str_type)
-            if raw_bytes:
-                if isinstance(raw_bytes, bytes):
-                    if str_type == getattr(idc, 'STRTYPE_C_16', 1):
-                        return raw_bytes.decode('utf-16le', errors='ignore')
-                    return raw_bytes.decode('utf-8', errors='ignore')
-                return str(raw_bytes)
-    except Exception:
-        pass
-
-    try:
-        c_bytes = idc.get_strlit_contents(ea, -1, getattr(idc, 'STRTYPE_C', 0))
-        if isinstance(c_bytes, bytes):
-            c_str = c_bytes.decode('utf-8', errors='ignore')
-        else:
-            c_str = str(c_bytes) if c_bytes else ""
-    except Exception:
-        c_str = ""
-
-    try:
-        c16_bytes = idc.get_strlit_contents(ea, -1, getattr(idc, 'STRTYPE_C_16', 1))
-        if isinstance(c16_bytes, bytes):
-            c16_str = c16_bytes.decode('utf-16le', errors='ignore')
-        else:
-            c16_str = str(c16_bytes) if c16_bytes else ""
-    except Exception:
-        c16_str = ""
-        
-    best_str = c16_str if len(c16_str) > len(c_str) else c_str
-    if best_str:
-        return best_str
-
-    try:
-        return db.bytes.get_string_at(ea)
-    except Exception:
-        return None
+        validated = out
+    return validated or out
 
 
-def extract_function_strings(db: Database, func) -> list:
-    """Iterate instructions of func, collect pretty strings referenced by
-    immediate push-like operands. Priority: if a string that looks like a
-    C++ qualified name (contains '::') is followed by a call to a SEH/throw
-    helper, it is promoted to the front of the list."""
-    if not func or func.size() < 8:
-        return []
-
-    found_strings = []
-    found_strings_set = set()
-    seh_name_candidate = None
-    seh_name_is_priority = False
-
-    instructions = list(db.functions.get_instructions(func))
-
-    string_xrefs = []  # list of (index_in_instructions, filtered_string)
-    for idx, insn in enumerate(instructions):
-        mnem = db.instructions.get_mnemonic(insn)
-        if mnem != "push":
-            continue
-        op = db.instructions.get_operand(insn, 0)
-        if not isinstance(op, ImmediateOperand):
-            continue
-        try:
-            val = op.get_value()
-        except Exception:
-            continue
-        s_full = _read_string_at(db, val)
-        if not s_full or len(s_full) < MIN_STRING_SIZE:
-            continue
-        filtered = filter_whitespace(s_full)
-        if (len(filtered) < MIN_STRING_SIZE or
-                filtered in found_strings_set or
-                not is_pretty_printable(filtered)):
-            continue
-        string_xrefs.append((idx, filtered))
-        found_strings.append([filtered, 1])
-        found_strings_set.add(filtered)
-
-    # SEH/throw promotion: if, shortly after a string push, a call to a
-    # SEH/throw-like helper appears, promote that string.
-    for idx, string_val in string_xrefs:
-        for look_ahead in range(1, 5):
-            ahead_idx = idx + look_ahead
-            if ahead_idx >= len(instructions):
-                break
-            ins2 = instructions[ahead_idx]
-            mnem2 = db.instructions.get_mnemonic(ins2)
-            if mnem2 != "call":
-                continue
-            disasm = db.instructions.get_disassembly(ins2) or ""
-            op_call = disasm.lower()
-            if any(w in op_call for w in ["appunwindf", "throw", "seh", "uncaught"]):
-                if "::" in string_val and len(string_val) > 5:
-                    seh_name_candidate = string_val
-                    seh_name_is_priority = True
-                    break
-        if seh_name_is_priority:
-            break
-
-    if seh_name_is_priority:
-        found_strings = [[seh_name_candidate, 1]] + [
-            s for s in found_strings if s[0] != seh_name_candidate
-        ]
-
-    return found_strings
+# Only these names are considered free to overwrite. Real symbols, including
+# mangled ones and manual renames, are always preserved.
+AUTOGEN_RE = re.compile(r"^(j_)?(sub|nullsub|unknown_libname|loc)_[0-9A-Fa-f]{3,}$")
 
 
-def generate_str_comment(function_strings: list) -> str:
-    if not function_strings:
+def is_autogen_func_name(name):
+    return bool(AUTOGEN_RE.match(name or ""))
+
+
+
+# Instruction helpers
+
+def mnem(ea):
+    return (idc.print_insn_mnem(ea) or "").lower()
+
+
+def is_push_imm(ea):
+    return mnem(ea) == "push" and idc.get_operand_type(ea, 0) == idc.o_imm
+
+
+def is_call(ea):
+    return mnem(ea) == "call"
+
+
+def call_target_name(ea):
+    """Names of a call target, including the import-table indirection."""
+    if not is_call(ea):
         return ""
-    seen = set()
-    unique_strings = []
-    for string_value, _ref_count in function_strings:
-        if string_value not in seen:
-            seen.add(string_value)
-            unique_strings.append(string_value)
-
-    comment_text = "#STR: "
-    first = True
-    for string_value in unique_strings:
-        required_size = len(string_value) + 2
-        available_size = MAX_COMMENT_SIZE - len(comment_text) - 1
-        if not first:
-            required_size += 2
-        if available_size < required_size:
-            break
-        if not first:
-            comment_text += ", "
-        comment_text += f"\"{string_value}\""
-        first = False
-    return comment_text
-
-
-def update_function_comment(db: Database, func, comment_text: str) -> None:
-    if not comment_text:
-        return
-    comment_text = safe_comment_text(comment_text)
-    if not g_replace_comments:
-        current_comment = (
-            db.functions.get_comment(func, repeatable=True)
-            or db.functions.get_comment(func, repeatable=False)
-            or ""
-        )
-        if current_comment:
-            combined_comment = current_comment + "\n" + comment_text
-        else:
-            combined_comment = comment_text
-        db.functions.set_comment(func, combined_comment, repeatable=True)
-    else:
-        db.functions.set_comment(func, comment_text, repeatable=True)
+    otype = idc.get_operand_type(ea, 0)
+    target = idc.get_operand_value(ea, 0)
+    names = []
+    if otype in (idc.o_near, idc.o_far, idc.o_mem, idc.o_imm):
+        indirect = ida_bytes.get_dword(target) if (otype == idc.o_mem and _is_loaded(target)) else None
+        for cand in (target, indirect):
+            if cand in (None, 0, idc.BADADDR):
+                continue
+            raw = ida_name.get_name(cand) or ""
+            if raw:
+                names.append(raw)
+                try:
+                    dem = idc.demangle_name(raw, idc.get_inf_attr(idc.INF_SHORT_DN)) or ""
+                except Exception:
+                    dem = ""
+                if dem:
+                    names.append(dem)
+    if not names:
+        names.append(idc.GetDisasm(ea) or "")
+    return " | ".join(names)
 
 
-def process_function_add_comments(db: Database, func) -> bool:
-    function_strings = extract_function_strings(db, func)
-    if function_strings:
-        comment_text = generate_str_comment(function_strings)
-        update_function_comment(db, func, comment_text)
-        return True
-    return False
-
-
-def is_valid_ida_func_name(function_name: str) -> bool:
-    if len(function_name) > 128:
+def is_unwind_helper_call(ea):
+    if not is_call(ea):
         return False
-    return bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*(::[A-Za-z_][A-Za-z0-9_]*)+$', function_name))
+    text = call_target_name(ea).lower()
+    return any(h.lower() in text for h in UNWIND_HELPERS)
 
 
-def extract_candidate_function_names(comment_text: str) -> list:
-    if not comment_text:
-        return []
-    candidate_names = []
-    str_comment_match = re.search(r'#STR:(.+)', comment_text)
-    if str_comment_match:
-        str_content = str_comment_match.group(1)
-        quoted_strings = re.findall(r'"(.*?)"', str_content)
-        for quoted_string in quoted_strings:
-            if "::" in quoted_string and is_valid_ida_func_name(quoted_string.replace("~", "___")):
-                candidate = quoted_string.replace("~", "___")
-                candidate_names.append(candidate)
-    return candidate_names
+def func_heads(func_ea):
+    """All instructions of a function, including tail chunks."""
+    try:
+        return list(idautils.FuncItems(func_ea))
+    except Exception:
+        return list(idautils.Heads(func_ea, idc.find_func_end(func_ea)))
 
 
-def is_autogen_func_name(function_name: str) -> bool:
-    return re.fullmatch(r'(sub_|nullsub_)[0-9A-Fa-f]{6,}', function_name or "") is not None
+
+# Source 1: structural MSVC C++ EH walk
+
+def find_funcinfo_ea(heads):
+    """Locate the FuncInfo structure of a function.
+
+    Matches the classic SEH prologue:
+        push 0FFFFFFFFh
+        push <seh_handler>
+        mov  eax, large fs:0
+        push eax
+        mov  large fs:0, esp
+    then reads FuncInfo out of 'mov eax, <FuncInfo>' in the handler trampoline.
+    """
+    for head in heads:
+        if not (mnem(head) == "push"
+                and idc.get_operand_type(head, 0) == idc.o_imm
+                and idc.get_operand_value(head, 0) in (0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF, -1)):
+            continue
+        h1 = idc.next_head(head)
+        if mnem(h1) != "push":
+            continue
+        seh_ea = idc.get_operand_value(h1, 0)
+        h2 = idc.next_head(h1)
+        if not (mnem(h2) == "mov"
+                and idc.get_operand_type(h2, 0) == idc.o_reg
+                and idc.get_operand_value(h2, 0) == 0
+                and idc.get_operand_type(h2, 1) == idc.o_mem
+                and idc.get_operand_value(h2, 1) == 0):
+            continue
+        h3 = idc.next_head(h2)
+        if not (mnem(h3) == "push"
+                and idc.get_operand_type(h3, 0) == idc.o_reg
+                and idc.get_operand_value(h3, 0) == 0):
+            continue
+        h4 = idc.next_head(h3)
+        if not (mnem(h4) == "mov"
+                and idc.get_operand_type(h4, 0) == idc.o_mem
+                and idc.get_operand_value(h4, 0) == 0
+                and idc.get_operand_type(h4, 1) == idc.o_reg
+                and idc.get_operand_value(h4, 1) == 4):
+            continue
+        if not _is_loaded(seh_ea):
+            continue
+        if (mnem(seh_ea) == "mov"
+                and idc.get_operand_type(seh_ea, 0) == idc.o_reg
+                and idc.get_operand_value(seh_ea, 0) == 0
+                and idc.get_operand_type(seh_ea, 1) == idc.o_imm):
+            return idc.get_operand_value(seh_ea, 1)
+    return None
 
 
-def process_function_rename(
-    db: Database,
-    func,
-    existing_names: set,
-    rename_map=None,
-    rename_counter=None,
-) -> str:
-    comment_text = db.functions.get_comment(func, repeatable=True) or ""
-    if not comment_text:
-        return 'none'
-    candidate_names = extract_candidate_function_names(comment_text)
-    if not candidate_names:
-        return 'none'
-    orig_name = candidate_names[0]
-    if not orig_name:
-        return 'none'
-    orig_name = orig_name[:240]
-    current_name = db.functions.get_name(func)
-    if not is_autogen_func_name(current_name):
-        return 'skip'
+def iter_catch_handlers(funcinfo_ea):
+    """Yield catch handler addresses.
 
-    if rename_map is not None and rename_counter is not None:
-        count = rename_counter.get(orig_name, 0)
-        postfix = "" if count == 0 else f"_{count}"
-        new_name_try = safe_func_name(f"{orig_name}{postfix}")
-        while new_name_try in existing_names or new_name_try in rename_map:
-            count += 1
-            new_name_try = safe_func_name(f"{orig_name}_{count}")
-        rename_counter[orig_name] = count + 1
-        rename_map[new_name_try] = func.start_ea
-        if current_name == new_name_try:
-            return 'none'
-        if db.functions.set_name(func, new_name_try):
-            existing_names.add(new_name_try)
-            return 'ok'
-        return 'err'
-
-    if len(candidate_names) > 1:
-        return 'warn'
-    new_name = orig_name
-    if not new_name or new_name == current_name:
-        return 'none'
-    if new_name in existing_names:
-        return 'warn'
-    if db.functions.set_name(func, new_name):
-        existing_names.add(new_name)
-        return 'ok'
-    return 'err'
+    Layout walked here:
+        FuncInfo:           magic(+0x0) nTryBlocks(+0xC) pTryBlockMap(+0x10)
+        TryBlockMapEntry:   size 0x14, nCatches(+0xC) pHandlerArray(+0x10)
+        HandlerType:        size 0x10, addressOfHandler(+0xC)
+    """
+    if not _is_loaded(funcinfo_ea):
+        return
+    if ida_bytes.get_dword(funcinfo_ea) not in FUNCINFO_MAGIC:
+        return
+    try_count = ida_bytes.get_dword(funcinfo_ea + 0x0C)
+    if not (0 < try_count <= MAX_TRY_BLOCKS):
+        return
+    try_map_ea = ida_bytes.get_dword(funcinfo_ea + 0x10)
+    if not _is_loaded(try_map_ea):
+        return
+    for i in range(try_count):
+        tb = try_map_ea + i * 0x14
+        if not _is_loaded(tb):
+            continue
+        catches = ida_bytes.get_dword(tb + 0x0C)
+        if not (0 < catches <= MAX_CATCHES):
+            continue
+        harr = ida_bytes.get_dword(tb + 0x10)
+        if not _is_loaded(harr):
+            continue
+        for j in range(catches):
+            hd = harr + j * 0x10
+            if not _is_loaded(hd):
+                continue
+            handler_ea = ida_bytes.get_dword(hd + 0x0C)
+            if _is_loaded(handler_ea):
+                yield handler_ea
 
 
-class ReplaceOrAppendDialog(QtWidgets.QDialog):
-    def __init__(self, function_count, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Function String Associate")
-        self.setModal(True)
-        layout = QtWidgets.QVBoxLayout()
-        label = QtWidgets.QLabel(
-            f"This will process all {function_count} functions.\n\n"
-            "If you choose REPLACE, existing function comments will be overwritten.\n"
-            "If unchecked, the plugin will APPEND to existing comments.\n"
-        )
-        layout.addWidget(label)
-        self.checkbox = QtWidgets.QCheckBox("Replace existing comments?")
-        layout.addWidget(self.checkbox)
-        SB = QtWidgets.QDialogButtonBox.StandardButton
-        button_box = QtWidgets.QDialogButtonBox(
-            SB(SB.Ok.value | SB.Cancel.value))
-        button_box.accepted.connect(self.accept)
-        button_box.rejected.connect(self.reject)
-        layout.addWidget(button_box)
-        self.setLayout(layout)
-    def should_replace(self):
-        return self.checkbox.isChecked()
+def name_from_handler(handler_ea):
+    """Scan a catch handler for 'push A; push B; call <AppUnwindF>' and return
+    whichever argument reads back as a function name."""
+    end = idc.find_func_end(handler_ea)
+    if end in (None, idc.BADADDR) or end <= handler_ea:
+        end = handler_ea + 0x800
 
-def show_qt_dialog(function_count):
-    dialog = ReplaceOrAppendDialog(function_count)
-    result = dialog.exec()
-    if result == QtWidgets.QDialog.DialogCode.Accepted:
-        return dialog.should_replace()
-    else:
-        return None
+    ea = handler_ea
+    prev_pushes = []
+    for _ in range(MAX_HANDLER_INSNS):
+        if ea in (None, idc.BADADDR) or ea >= end:
+            break
+        if is_push_imm(ea):
+            prev_pushes.append(idc.get_operand_value(ea, 0))
+            if len(prev_pushes) > 4:
+                prev_pushes.pop(0)
+        elif is_call(ea):
+            helper = is_unwind_helper_call(ea)
+            # Arguments are pushed right-to-left, so scan the newest first.
+            for val in reversed(prev_pushes):
+                text, _from_literal = read_any_string(val)
+                if not text:
+                    continue
+                text = filter_whitespace(text)
+                if looks_like_func_name(text) and len(text) >= MIN_STRING_SIZE:
+                    return text, (CONF_SEH if helper else CONF_SEH - 20)
+            prev_pushes = []
+        elif mnem(ea) in ("retn", "ret", "jmp"):
+            prev_pushes = []
+        ea = idc.next_head(ea, end)
+    return None, 0
 
-class FunctionStringAssociatePlugin(idaapi.plugin_t):
+
+def seh_name_for_function(heads):
+    funcinfo_ea = find_funcinfo_ea(heads)
+    if not funcinfo_ea:
+        return None, 0
+    best, best_conf = None, 0
+    for handler_ea in iter_catch_handlers(funcinfo_ea):
+        name, conf = name_from_handler(handler_ea)
+        if name and conf > best_conf:
+            best, best_conf = name, conf
+            if conf >= CONF_SEH:
+                break
+    return best, best_conf
+
+
+# Source 2: strings referenced by the function
+
+def collect_function_strings(heads):
+    """Collect strings referenced from a function.
+
+    Reference sources:
+      * XREF_DATA from any instruction (mov / lea / push / cmp / ...), as in the
+        original plugin;
+      * push imm, to catch constants IDA does not treat as offsets - a large
+        share of the UTF-16 strings in game clients arrive this way.
+
+    Returns ([[text, ref_count], ...], name_candidate, confidence). The list is
+    sorted by reference count descending and truncated to MAX_LINE_STRING_COUNT,
+    so the comment holds the most characteristic strings rather than whichever
+    ten happened to come first.
+    """
+    counts = {}
+    order = []
+    cand_name, cand_conf = None, 0
+
+    for i, ea in enumerate(heads):
+        targets = []
+        try:
+            for xref in idautils.XrefsFrom(ea, idaapi.XREF_DATA):
+                targets.append(xref.to)
+        except Exception:
+            pass
+        if is_push_imm(ea):
+            targets.append(idc.get_operand_value(ea, 0))
+
+        for val in targets:
+            if not is_string_target(val):
+                continue
+            text, from_literal = read_any_string(val)
+            if not text:
+                continue
+            text = filter_whitespace(text)
+            if not is_comment_worthy(text, from_literal):
+                continue
+
+            if text in counts:
+                counts[text] += 1
+            elif len(order) < MAX_STRINGS_SCANNED:
+                counts[text] = 1
+                order.append(text)
+
+            # The name candidate is searched across the whole function; the
+            # comment limit must not hide a name that appears late.
+            if looks_like_func_name(text):
+                near_helper = any(
+                    is_unwind_helper_call(heads[j])
+                    for j in range(i + 1, min(i + 6, len(heads)))
+                )
+                conf = CONF_CALLSITE if near_helper else CONF_STRING
+                if "::" in text:
+                    conf += 5
+                if conf > cand_conf:
+                    cand_name, cand_conf = text, conf
+
+    # sorted() is stable, so equally referenced strings keep code order.
+    strings = sorted(([s, counts[s]] for s in order), key=lambda x: x[1], reverse=True)
+    return strings[:MAX_LINE_STRING_COUNT], cand_name, cand_conf
+
+
+def build_comment(strings):
+    """Format [[text, refs], ...] into a '#STR: "a", "b"' comment."""
+    if not strings:
+        return ""
+    out = "#STR: "
+    first = True
+    for text, _refs in strings:
+        need = len(text) + 2 + (0 if first else 2)
+        if MAX_COMMENT_SIZE - len(out) - 1 < need:
+            break
+        out += ("" if first else ", ") + '"%s"' % text
+        first = False
+    return "" if first else out
+
+
+# Rename planner
+
+def collect_reserved_names(rename_eas):
+    """Every name already in the database except the ones we are replacing."""
+    reserved = set()
+    for ea, name in idautils.Names():
+        if ea in rename_eas:
+            continue
+        reserved.add(name)
+    return reserved
+
+
+def plan_renames(candidates):
+    """Map {func_ea: (raw_name, confidence)} to {func_ea: final_name}.
+
+    A base name is used bare when a single function claims it, otherwise the
+    suffix scheme from SUFFIX_MODE applies. Ordering is by address, so repeated
+    runs produce identical names instead of shuffling suffixes around.
+    """
+    by_base = {}
+    for ea in sorted(candidates):
+        raw, conf = candidates[ea]
+        base = sanitize_name(raw)
+        if not base:
+            continue
+        by_base.setdefault(base, []).append((ea, conf))
+
+    reserved = collect_reserved_names(set(candidates))
+    plan = {}
+    used = set()
+    for base, items in by_base.items():
+        items.sort(key=lambda t: t[0])
+        single = len(items) == 1
+        for idx, (ea, _conf) in enumerate(items):
+            if single and base not in reserved and base not in used:
+                final = base
+            elif SUFFIX_MODE == "addr":
+                final = "%s_%X" % (base, ea)
+            else:
+                if idx == 0 and base not in reserved and base not in used:
+                    final = base
+                else:
+                    n = max(idx, 1)
+                    final = "%s_%d" % (base, n)
+                    while final in reserved or final in used:
+                        n += 1
+                        final = "%s_%d" % (base, n)
+            while final in reserved or final in used:
+                final += "_"
+            used.add(final)
+            plan[ea] = final
+    return plan
+
+
+# Reporting
+def print_report(rows, title=PLUGIN_NAME):
+    width = 62
+    print("")
+    print("=" * width)
+    print(" %s ~ summary ~" % title)
+    print("-" * width)
+    label_w = max(len(label) for label, _ in rows)
+    for label, value in rows:
+        print("  %-*s  %12s" % (label_w, label, value))
+    print("=" * width)
+    print("")
+
+
+# Main pass
+def run(add_comments=True, replace_comments=False, rename=True, min_confidence=CONF_STRING,
+        verbose=True):
+    t0 = time.time()
+    _STR_CACHE.clear()
+
+    funcs = list(idautils.Functions())
+    total = len(funcs)
+
+    candidates = {}
+    commented = 0
+    seh_hits = 0
+    skipped_small = 0
+    named_already = 0
+    renamed = 0
+    failed = 0
+    cancelled = False
+
+    ida_kernwin.show_wait_box("%s: analyzing..." % PLUGIN_NAME)
+    try:
+        for i, func_ea in enumerate(funcs):
+            if i % 100 == 0:
+                ida_kernwin.replace_wait_box("Analyzing %d/%d" % (i + 1, total))
+                if ida_kernwin.user_cancelled():
+                    cancelled = True
+                    break
+
+            if func_size(func_ea) < MIN_FUNC_SIZE:
+                skipped_small += 1
+                continue
+
+            cur_name = get_function_name(func_ea)
+            # Renaming touches auto-generated names only, but commenting applies
+            # to every function - mangled symbols included.
+            want_rename = rename and is_autogen_func_name(cur_name)
+            if not want_rename and not cur_name.startswith("sub_"):
+                named_already += 1
+
+            heads = func_heads(func_ea)
+            if not heads:
+                continue
+
+            strings, str_name, str_conf = collect_function_strings(heads)
+
+            if add_comments and strings:
+                cmt = build_comment(strings)
+                if cmt:
+                    old = get_func_comment(func_ea, True)
+                    if replace_comments or not old:
+                        new_cmt = cmt
+                    elif cmt in old:
+                        new_cmt = old          # idempotent on repeated runs
+                    else:
+                        new_cmt = old + "\n" + cmt
+                    if new_cmt != old and set_func_comment(func_ea, new_cmt[:MAX_FUNC_COMMENT], True):
+                        commented += 1
+
+            if not want_rename:
+                continue
+
+            # The EH walk is comparatively expensive, so run it only for
+            # functions that can actually be renamed.
+            seh_name, seh_conf = seh_name_for_function(heads)
+            if seh_name:
+                seh_hits += 1
+
+            best_name, best_conf = None, 0
+            for nm, cf in ((seh_name, seh_conf), (str_name, str_conf)):
+                if nm and cf > best_conf:
+                    best_name, best_conf = nm, cf
+
+            if best_name and best_conf >= min_confidence:
+                candidates[func_ea] = (best_name, best_conf)
+
+        if rename and not cancelled:
+            ida_kernwin.replace_wait_box("Planning names...")
+            plan = plan_renames(candidates)
+
+            for i, (ea, name) in enumerate(sorted(plan.items())):
+                if i % 200 == 0:
+                    ida_kernwin.replace_wait_box("Renaming %d/%d" % (i + 1, len(plan)))
+                    if ida_kernwin.user_cancelled():
+                        cancelled = True
+                        break
+                old = get_function_name(ea)
+                if old == name:
+                    continue
+                try:
+                    done = ida_name.set_name(ea, name, ida_name.SN_NOCHECK | ida_name.SN_FORCE)
+                except Exception:
+                    done = False
+                if done:
+                    renamed += 1
+                    if verbose:
+                        print("  %s -> %s" % (old, name))
+                else:
+                    failed += 1
+                    print("  [!] rename failed: %s -> %s" % (old, name))
+    finally:
+        ida_kernwin.hide_wait_box()
+
+    if cancelled:
+        print("[%s] Cancelled by user." % PLUGIN_NAME)
+
+    print_report([
+        ("Functions total", total),
+        ("Skipped (< %d bytes)" % MIN_FUNC_SIZE, skipped_small),
+        ("Already named (rename skipped)", named_already),
+        ("#STR comments written", commented),
+        ("Names from catch/SEH", seh_hits),
+        ("Rename candidates", len(candidates)),
+        ("Renamed", renamed),
+        ("Failed", failed),
+        ("Elapsed", "%.2f s" % (time.time() - t0)),
+    ])
+    idaapi.refresh_idaview_anyway()
+
+
+# Plugin wrapper
+
+class FunctionStringAssociateExtraPlugin(idaapi.plugin_t):
     flags = idaapi.PLUGIN_UNL
-    comment = "Extracts strings from functions as comments then renames via #STR"
+    comment = "Extracts strings into #STR comments and renames functions via SEH/catch data"
     help = comment
     wanted_name = PLUGIN_NAME
     wanted_hotkey = PLUGIN_HOTKEY
 
     def init(self):
-        print(f"[{PLUGIN_NAME}] Plugin loaded.")
+        print("[%s] Plugin loaded." % PLUGIN_NAME)
         return idaapi.PLUGIN_OK
 
     def run(self, arg):
         if not ida_auto.auto_is_ok():
             ida_kernwin.warning("Please wait until auto-analysis completes!")
             return
-
-        db = Database.open()
-        all_functions = list(db.functions.get_all())
-        total = len(all_functions)
-
-        user_choice = show_qt_dialog(total)
-        if user_choice is None:
+        answer = ida_kernwin.ask_yn(
+            0,
+            "Replace existing function comments?\n\n"
+            "Yes - overwrite existing comments\n"
+            "No  - append to existing comments",
+        )
+        if answer == -1:
             return
-        global g_replace_comments
-        g_replace_comments = user_choice
-        comment_mode = "REPLACE" if g_replace_comments else "APPEND"
-        print(f"[{PLUGIN_NAME}] Starting in {comment_mode} mode.")
-        start_time = time.time()
-        ida_kernwin.show_wait_box("Function String Associate: adding comments...")
-        comment_count = 0
-        for idx, func in enumerate(all_functions):
-            if process_function_add_comments(db, func):
-                comment_count += 1
-            if idx % 100 == 0:
-                ida_kernwin.replace_wait_box(f"Processing comments: {idx+1}/{total}")
-                if ida_kernwin.user_cancelled():
-                    print("[INFO] Cancelled by user.")
-                    ida_kernwin.hide_wait_box()
-                    return
-
-        # Prefill the set of existing names from the database so we can avoid
-        # collisions when generating new names during rename.
-        existing_names = {name for _ea, name in db.names.get_all()}
-
-        rename_stats = dict(ok=0, warn=0, skip=0, err=0)
-        ida_kernwin.replace_wait_box("Renaming functions...")
-        rename_map = {}     # function_name -> function_ea
-        rename_counter = {} # function_name -> count
-        for idx, func in enumerate(all_functions):
-            status = process_function_rename(
-                db, func, existing_names,
-                rename_map=rename_map, rename_counter=rename_counter,
-            )
-            if status in rename_stats:
-                rename_stats[status] += 1
-            if idx % 100 == 0:
-                ida_kernwin.replace_wait_box(f"Renaming: {idx+1}/{total}")
-                if ida_kernwin.user_cancelled():
-                    print("[INFO] Cancelled by user.")
-                    break
-        ida_kernwin.hide_wait_box()
-        elapsed = time.time() - start_time
-        print(f"\n[{PLUGIN_NAME}]")
-        print(f"--- Summary ---")
-        print(f"Functions with new comments: {comment_count}")
-        print(f"Renamed:                    {rename_stats['ok']}")
-        print(f"Skipped (custom name):      {rename_stats['skip']}")
-        print(f"Warnings:                   {rename_stats['warn']}")
-        print(f"Errors:                     {rename_stats['err']}")
-        print(f"Total time:                 {elapsed:.2f} sec")
-        print("------------------------\n")
-        idaapi.refresh_idaview_anyway()
+        print("[%s] Starting in %s mode." % (PLUGIN_NAME, "REPLACE" if answer else "APPEND"))
+        run(add_comments=True, replace_comments=bool(answer), rename=True)
 
     def term(self):
-        print(f"[{PLUGIN_NAME}] Plugin exited.")
+        pass
+
 
 def PLUGIN_ENTRY():
-    return FunctionStringAssociatePlugin()
+    return FunctionStringAssociateExtraPlugin()
+
+
+if __name__ == "__main__":
+    # Allows running as a plain script: File > Script file...
+    run(add_comments=True, replace_comments=False, rename=True)
